@@ -1,0 +1,209 @@
+{
+  "id": "swiftdrop-04-track",
+  "name": "04 - Track Delivery",
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "n1-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1240, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nlet context = input.context || {};\nif (typeof context === 'string') {\n  try { context = JSON.parse(context); } catch (e) { context = {}; }\n}\nconst text = (input.message || '').trim();\nconst state = input.current_state || 'NEW';\n\nconst match = text.toUpperCase().match(/SD-\\d{4,}/);\n\nlet next_state = state;\nlet reply = '';\nlet action = 'NONE';\n\nif (match) {\n  context.tracking_number = match[0];\n  action = 'LOOKUP';\n} else if (state === 'NEW') {\n  next_state = 'AWAITING_TRACKING_NUMBER';\n  reply = \"Sure! What's your tracking number? (e.g. SD-1042)\";\n} else {\n  next_state = 'AWAITING_TRACKING_NUMBER';\n  reply = \"That doesn't look like a valid tracking number. It should look like SD-1042. Please try again.\";\n}\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    phone: input.phone,\n    conversation_id: input.conversation_id || null,\n    next_state,\n    context,\n    reply,\n    action\n  }\n}];"
+      },
+      "id": "n2-process-state",
+      "name": "Process Tracking State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1020, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-lookup",
+              "leftValue": "={{$json.action}}",
+              "rightValue": "LOOKUP",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n3-needs-lookup",
+      "name": "Needs Lookup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-800, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const tn = $json.context.tracking_number;\nif (tn === 'SD-0000') {\n  throw new Error('Tracking service timeout (simulated)');\n}\nreturn [{ json: $json }];"
+      },
+      "id": "n4b-simulated-tracking-call",
+      "name": "Simulated Tracking Service Call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-580, -140],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 400,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT d.status, d.pickup_location, d.delivery_location\nFROM (SELECT $1::text AS tn) q\nLEFT JOIN deliveries d ON d.tracking_number = q.tn",
+        "options": { "queryReplacement": "={{ [ $json.context.tracking_number ] }}" }
+      },
+      "id": "n4-find-delivery",
+      "name": "Find Delivery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-360, -220],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Tracking State').item.json;\nreturn [{\n  json: {\n    ...base,\n    reply: \"We're currently unable to retrieve your tracking information. I've sent the request to our operations team for follow-up.\",\n    next_state: 'HUMAN_ESCALATION',\n    found: false\n  }\n}];"
+      },
+      "id": "n4c-build-failure-reply",
+      "name": "Build Integration Failure Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-360, -60]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (customer_id, reason, priority) VALUES ($1, $2, 'MEDIUM') RETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.customer_id, 'Tracking service unavailable for ' + ($json.context.tracking_number || 'unknown') ] }}" }
+      },
+      "id": "n4d-create-escalation-failure",
+      "name": "Create Escalation (Integration Failure)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-140, -60],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ('INTEGRATION_FAILURE', 'customer', $1, $2::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Build Integration Failure Reply').item.json.customer_id, JSON.stringify({ service: 'tracking', tracking_number: $('Build Integration Failure Reply').item.json.context.tracking_number || null }) ] }}" }
+      },
+      "id": "n4e-audit-integration-failure",
+      "name": "Audit Integration Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [80, -60],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Tracking State').item.json;\nconst row = $json;\nlet reply, next_state;\nif (row.status) {\n  reply = `Your delivery ${base.context.tracking_number} is currently ${row.status.replace(/_/g, ' ')}.`;\n  next_state = 'COMPLETED';\n} else {\n  reply = `I couldn't find a delivery with tracking number ${base.context.tracking_number}. Please double-check and try again.`;\n  next_state = 'AWAITING_TRACKING_NUMBER';\n}\nreturn [{ json: { ...base, reply, next_state, found: !!row.status } }];"
+      },
+      "id": "n5-build-lookup-reply",
+      "name": "Build Lookup Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-360, -140]
+    },
+    {
+      "parameters": { "jsCode": "return [{ json: $json }];" },
+      "id": "n6-finalize-payload",
+      "name": "Finalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-140, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (id, customer_id, current_intent, current_state, context, is_active)\nVALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'TRACK_DELIVERY', $3, $4::jsonb, $5)\nON CONFLICT (id) DO UPDATE SET\n  current_intent = EXCLUDED.current_intent,\n  current_state = EXCLUDED.current_state,\n  context = EXCLUDED.context,\n  is_active = EXCLUDED.is_active,\n  updated_at = now()\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.conversation_id || null, $json.customer_id, $json.next_state, JSON.stringify($json.context), !['COMPLETED','IDLE','HUMAN_ESCALATION'].includes($json.next_state) ] }}" }
+      },
+      "id": "n7-upsert-conversation",
+      "name": "Upsert Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [80, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (customer_id, conversation_id, direction, body, intent, status)\nVALUES ($1, $2, 'OUTBOUND', $3, 'TRACK_DELIVERY', 'PROCESSED')",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, $json.id || null, $('Finalize Payload').item.json.reply ] }}" }
+      },
+      "id": "n8-save-outbound",
+      "name": "Save Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [300, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ('TRACKING_REQUEST', 'customer', $1, $2::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, JSON.stringify({ tracking_number: $('Finalize Payload').item.json.context.tracking_number || null, found: $('Finalize Payload').item.json.found || false }) ] }}" }
+      },
+      "id": "n9-audit-event",
+      "name": "Audit Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Finalize Payload').item.json;\nreturn [{\n  json: {\n    reply: f.reply,\n    next_state: f.next_state,\n    customer_id: f.customer_id,\n    conversation_id: f.conversation_id\n  }\n}];"
+      },
+      "id": "n10-build-output",
+      "name": "Build Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": { "main": [[{ "node": "Process Tracking State", "type": "main", "index": 0 }]] },
+    "Process Tracking State": { "main": [[{ "node": "Needs Lookup?", "type": "main", "index": 0 }]] },
+    "Needs Lookup?": {
+      "main": [
+        [{ "node": "Simulated Tracking Service Call", "type": "main", "index": 0 }],
+        [{ "node": "Finalize Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Simulated Tracking Service Call": {
+      "main": [
+        [{ "node": "Find Delivery", "type": "main", "index": 0 }],
+        [{ "node": "Build Integration Failure Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find Delivery": { "main": [[{ "node": "Build Lookup Reply", "type": "main", "index": 0 }]] },
+    "Build Lookup Reply": { "main": [[{ "node": "Finalize Payload", "type": "main", "index": 0 }]] },
+    "Build Integration Failure Reply": {
+      "main": [
+        [
+          { "node": "Create Escalation (Integration Failure)", "type": "main", "index": 0 },
+          { "node": "Audit Integration Failure", "type": "main", "index": 0 },
+          { "node": "Finalize Payload", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Finalize Payload": { "main": [[{ "node": "Upsert Conversation", "type": "main", "index": 0 }]] },
+    "Upsert Conversation": { "main": [[{ "node": "Save Outbound Message", "type": "main", "index": 0 }]] },
+    "Save Outbound Message": { "main": [[{ "node": "Audit Event", "type": "main", "index": 0 }]] },
+    "Audit Event": { "main": [[{ "node": "Build Output", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

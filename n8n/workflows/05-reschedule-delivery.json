@@ -1,0 +1,233 @@
+{
+  "id": "swiftdrop-05-reschedule",
+  "name": "05 - Reschedule Delivery",
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "n1-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1680, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nlet context = input.context || {};\nif (typeof context === 'string') {\n  try { context = JSON.parse(context); } catch (e) { context = {}; }\n}\nconst text = (input.message || '').trim();\nconst state = input.current_state || 'NEW';\n\nlet next_state = state;\nlet reply = '';\nlet action = 'NONE';\n\nif (state === 'AWAITING_NEW_DATE') {\n  const parsed = new Date(text);\n  if (isNaN(parsed.getTime())) {\n    next_state = 'AWAITING_NEW_DATE';\n    reply = \"I couldn't understand that date. Please use a format like 2026-10-15.\";\n  } else {\n    context.requested_date = parsed.toISOString().slice(0, 10);\n    action = 'UPDATE_DATE';\n  }\n} else {\n  const match = text.toUpperCase().match(/SD-\\d{4,}/);\n  if (match) {\n    context.tracking_number = match[0];\n    action = 'LOOKUP';\n  } else {\n    next_state = 'AWAITING_TRACKING_NUMBER';\n    reply = 'Sure! Which delivery would you like to reschedule? Please share the tracking number (e.g. SD-1042).';\n  }\n}\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    phone: input.phone,\n    conversation_id: input.conversation_id || null,\n    next_state,\n    context,\n    reply,\n    action\n  }\n}];"
+      },
+      "id": "n2-process-state",
+      "name": "Process Reschedule State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1460, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-lookup", "leftValue": "={{$json.action}}", "rightValue": "LOOKUP", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n3-needs-lookup",
+      "name": "Needs Lookup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1240, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT d.status\nFROM (SELECT $1::text AS tn) q\nLEFT JOIN deliveries d ON d.tracking_number = q.tn",
+        "options": { "queryReplacement": "={{ [ $json.context.tracking_number ] }}" }
+      },
+      "id": "n4-find-delivery",
+      "name": "Find Delivery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-1020, -280],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Reschedule State').item.json;\nconst row = $json;\nconst ELIGIBLE = ['PENDING', 'CONFIRMED', 'OUT_FOR_DELIVERY'];\nlet reply, next_state, action = 'NONE';\nif (!row.status) {\n  reply = `I couldn't find a delivery with tracking number ${base.context.tracking_number}. Please double-check and try again.`;\n  next_state = 'AWAITING_TRACKING_NUMBER';\n} else if (!ELIGIBLE.includes(row.status)) {\n  reply = `That delivery is already ${row.status.replace(/_/g, ' ').toLowerCase()}, so it can't be rescheduled automatically. I've sent this to our operations team to help.`;\n  next_state = 'HUMAN_ESCALATION';\n  action = 'ESCALATE_INELIGIBLE';\n} else {\n  reply = 'What date would you like to reschedule to? (e.g. 2026-10-15)';\n  next_state = 'AWAITING_NEW_DATE';\n}\nreturn [{ json: { ...base, reply, next_state, action } }];"
+      },
+      "id": "n5-evaluate-eligibility",
+      "name": "Evaluate Eligibility",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-800, -280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-update", "leftValue": "={{$json.action}}", "rightValue": "UPDATE_DATE", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n6-needs-update",
+      "name": "Needs Date Update?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-580, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE deliveries SET scheduled_date = $1::date WHERE tracking_number = $2 RETURNING scheduled_date",
+        "options": { "queryReplacement": "={{ [ $json.context.requested_date, $json.context.tracking_number ] }}" }
+      },
+      "id": "n7-update-date",
+      "name": "Update Scheduled Date",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-360, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Reschedule State').item.json;\nreturn [{ json: { ...base, reply: `Your delivery ${base.context.tracking_number} has been rescheduled to ${base.context.requested_date}.`, next_state: 'COMPLETED' } }];"
+      },
+      "id": "n8-build-confirmation",
+      "name": "Build Reschedule Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-140, -140]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-escalate", "leftValue": "={{$json.action}}", "rightValue": "ESCALATE_INELIGIBLE", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n9-needs-escalation",
+      "name": "Needs Escalation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [80, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (customer_id, delivery_id, reason, priority)\nVALUES ($1, (SELECT id FROM deliveries WHERE tracking_number = $2), $3, 'MEDIUM')\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.customer_id, $json.context.tracking_number, 'Reschedule requested for non-eligible delivery: ' + $json.context.tracking_number ] }}" }
+      },
+      "id": "n10-create-escalation",
+      "name": "Create Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [300, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": { "jsCode": "const base = $('Evaluate Eligibility').item.json;\nreturn [{ json: { ...base } }];" },
+      "id": "n11-pass-through-escalation",
+      "name": "Pass Through After Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, -140]
+    },
+    {
+      "parameters": { "jsCode": "return [{ json: $json }];" },
+      "id": "n12-finalize-payload",
+      "name": "Finalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (id, customer_id, current_intent, current_state, context, is_active)\nVALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'RESCHEDULE_DELIVERY', $3, $4::jsonb, $5)\nON CONFLICT (id) DO UPDATE SET\n  current_intent = EXCLUDED.current_intent,\n  current_state = EXCLUDED.current_state,\n  context = EXCLUDED.context,\n  is_active = EXCLUDED.is_active,\n  updated_at = now()\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.conversation_id || null, $json.customer_id, $json.next_state, JSON.stringify($json.context), !['COMPLETED','IDLE','HUMAN_ESCALATION'].includes($json.next_state) ] }}" }
+      },
+      "id": "n13-upsert-conversation",
+      "name": "Upsert Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [960, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (customer_id, conversation_id, direction, body, intent, status)\nVALUES ($1, $2, 'OUTBOUND', $3, 'RESCHEDULE_DELIVERY', 'PROCESSED')",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, $json.id || null, $('Finalize Payload').item.json.reply ] }}" }
+      },
+      "id": "n14-save-outbound",
+      "name": "Save Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1180, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ($1, 'customer', $2, $3::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.next_state === 'HUMAN_ESCALATION' ? 'ESCALATION_CREATED' : ($('Finalize Payload').item.json.next_state === 'COMPLETED' ? 'DELIVERY_RESCHEDULED' : 'STATE_ADVANCED'), $('Finalize Payload').item.json.customer_id, JSON.stringify({ next_state: $('Finalize Payload').item.json.next_state, tracking_number: $('Finalize Payload').item.json.context.tracking_number || null, requested_date: $('Finalize Payload').item.json.context.requested_date || null }) ] }}" }
+      },
+      "id": "n15-audit-event",
+      "name": "Audit Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1400, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Finalize Payload').item.json;\nreturn [{\n  json: {\n    reply: f.reply,\n    next_state: f.next_state,\n    customer_id: f.customer_id,\n    conversation_id: f.conversation_id\n  }\n}];"
+      },
+      "id": "n16-build-output",
+      "name": "Build Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": { "main": [[{ "node": "Process Reschedule State", "type": "main", "index": 0 }]] },
+    "Process Reschedule State": { "main": [[{ "node": "Needs Lookup?", "type": "main", "index": 0 }]] },
+    "Needs Lookup?": {
+      "main": [
+        [{ "node": "Find Delivery", "type": "main", "index": 0 }],
+        [{ "node": "Needs Date Update?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find Delivery": { "main": [[{ "node": "Evaluate Eligibility", "type": "main", "index": 0 }]] },
+    "Evaluate Eligibility": { "main": [[{ "node": "Needs Date Update?", "type": "main", "index": 0 }]] },
+    "Needs Date Update?": {
+      "main": [
+        [{ "node": "Update Scheduled Date", "type": "main", "index": 0 }],
+        [{ "node": "Needs Escalation?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Scheduled Date": { "main": [[{ "node": "Build Reschedule Confirmation", "type": "main", "index": 0 }]] },
+    "Build Reschedule Confirmation": { "main": [[{ "node": "Needs Escalation?", "type": "main", "index": 0 }]] },
+    "Needs Escalation?": {
+      "main": [
+        [{ "node": "Create Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Finalize Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Escalation": { "main": [[{ "node": "Pass Through After Escalation", "type": "main", "index": 0 }]] },
+    "Pass Through After Escalation": { "main": [[{ "node": "Finalize Payload", "type": "main", "index": 0 }]] },
+    "Finalize Payload": { "main": [[{ "node": "Upsert Conversation", "type": "main", "index": 0 }]] },
+    "Upsert Conversation": { "main": [[{ "node": "Save Outbound Message", "type": "main", "index": 0 }]] },
+    "Save Outbound Message": { "main": [[{ "node": "Audit Event", "type": "main", "index": 0 }]] },
+    "Audit Event": { "main": [[{ "node": "Build Output", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

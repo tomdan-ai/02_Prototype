@@ -1,0 +1,201 @@
+{
+  "id": "swiftdrop-02-delivery",
+  "name": "02 - Delivery Request",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "n1-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1680, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nlet context = input.context || {};\nif (typeof context === 'string') {\n  try { context = JSON.parse(context); } catch (e) { context = {}; }\n}\nconst text = (input.message || '').trim();\nconst state = input.current_state || 'NEW';\n\nconst PRICES = { SMALL: 3000, MEDIUM: 4500, LARGE: 6000 };\nconst SUPPORTED_ROUTES = [\n  ['Uyo', 'Aba'], ['Aba', 'Uyo'], ['Uyo', 'Port Harcourt'], ['Port Harcourt', 'Uyo']\n];\n\nfunction normPhone(raw) {\n  let p = String(raw).replace(/[^0-9+]/g, '');\n  if (p.startsWith('0')) p = '+234' + p.slice(1);\n  else if (p.startsWith('234')) p = '+' + p;\n  else if (!p.startsWith('+')) p = '+' + p;\n  return p;\n}\n\nfunction routeSupported(pickup, dest) {\n  const norm = (s) => (s || '').trim().toLowerCase();\n  return SUPPORTED_ROUTES.some(([a, b]) => norm(a) === norm(pickup) && norm(b) === norm(dest));\n}\n\nlet next_state = state;\nlet reply = '';\nlet action = 'NONE';\n\nswitch (state) {\n  case 'NEW':\n    next_state = 'AWAITING_PICKUP_LOCATION';\n    reply = \"Sure! What's the pickup location?\";\n    break;\n\n  case 'AWAITING_PICKUP_LOCATION':\n    context.pickup_location = text;\n    next_state = 'AWAITING_DELIVERY_LOCATION';\n    reply = \"What's the delivery location?\";\n    break;\n\n  case 'AWAITING_DELIVERY_LOCATION':\n    context.delivery_location = text;\n    next_state = 'AWAITING_PACKAGE_DESCRIPTION';\n    reply = 'What are you sending?';\n    break;\n\n  case 'AWAITING_PACKAGE_DESCRIPTION':\n    context.package_description = text;\n    next_state = 'AWAITING_PACKAGE_SIZE';\n    reply = 'What size is the package? Small, Medium, or Large?';\n    break;\n\n  case 'AWAITING_PACKAGE_SIZE': {\n    const m = text.toUpperCase().match(/SMALL|MEDIUM|LARGE/);\n    if (!m) {\n      next_state = 'AWAITING_PACKAGE_SIZE';\n      reply = 'Please select a package size: Small, Medium, or Large.';\n    } else {\n      context.package_size = m[0];\n      next_state = 'AWAITING_RECIPIENT_NAME';\n      reply = \"What's the recipient's name?\";\n    }\n    break;\n  }\n\n  case 'AWAITING_RECIPIENT_NAME':\n    context.recipient_name = text;\n    next_state = 'AWAITING_RECIPIENT_PHONE';\n    reply = \"What's the recipient's phone number?\";\n    break;\n\n  case 'AWAITING_RECIPIENT_PHONE': {\n    const digits = text.replace(/[^0-9]/g, '');\n    if (digits.length < 10) {\n      next_state = 'AWAITING_RECIPIENT_PHONE';\n      reply = \"That doesn't look like a valid phone number. Please provide the recipient's phone number.\";\n    } else {\n      context.recipient_phone = normPhone(text);\n      const fee = PRICES[context.package_size] || PRICES.MEDIUM;\n      context.quote_amount = fee;\n      next_state = 'AWAITING_CONFIRMATION';\n      reply = `Your estimated delivery fee is \\u20a6${fee.toLocaleString()}. Would you like to confirm? (yes/no)`;\n    }\n    break;\n  }\n\n  case 'AWAITING_CONFIRMATION': {\n    const t = text.toLowerCase();\n    if (/^(yes|yep|yeah|confirm|ok|okay|sure)/.test(t)) {\n      if (!routeSupported(context.pickup_location, context.delivery_location)) {\n        next_state = 'HUMAN_ESCALATION';\n        action = 'ESCALATE_ROUTE';\n        reply = \"That route isn't in our standard list, so I've sent this to our operations team to confirm pricing and availability. They'll follow up shortly.\";\n      } else {\n        next_state = 'COMPLETED';\n        action = 'CREATE_DELIVERY';\n        reply = 'PENDING_TRACKING_NUMBER';\n      }\n    } else if (/^(no|nope|cancel)/.test(t)) {\n      next_state = 'IDLE';\n      reply = \"No problem, your request has been cancelled. Let me know if you'd like to start again.\";\n      context = {};\n    } else {\n      next_state = 'AWAITING_CONFIRMATION';\n      reply = `Sorry, I didn't catch that. Your estimated delivery fee is \\u20a6${(context.quote_amount || 0).toLocaleString()}. Please reply yes to confirm or no to cancel.`;\n    }\n    break;\n  }\n\n  default:\n    next_state = 'AWAITING_PICKUP_LOCATION';\n    reply = \"Let's start again. What's the pickup location?\";\n}\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    phone: input.phone,\n    conversation_id: input.conversation_id || null,\n    next_state,\n    context,\n    reply,\n    action\n  }\n}];"
+      },
+      "id": "n2-process-state",
+      "name": "Process Delivery Request State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1460, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-create",
+              "leftValue": "={{$json.action}}",
+              "rightValue": "CREATE_DELIVERY",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n3-is-create",
+      "name": "Is Create Delivery?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1240, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO deliveries (tracking_number, customer_id, pickup_location, delivery_location, package_description, package_size, recipient_name, recipient_phone, status, delivery_fee)\nVALUES ('SD-' || nextval('tracking_number_seq'), $1, $2, $3, $4, $5, $6, $7, 'CONFIRMED', $8)\nRETURNING tracking_number",
+        "options": { "queryReplacement": "={{ [ $json.customer_id, $json.context.pickup_location, $json.context.delivery_location, $json.context.package_description, $json.context.package_size, $json.context.recipient_name, $json.context.recipient_phone, $json.context.quote_amount ] }}" }
+      },
+      "id": "n4-create-delivery",
+      "name": "Create Delivery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-1020, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Delivery Request State').item.json;\nconst row = $json;\nreturn [{\n  json: {\n    ...base,\n    reply: `Your delivery request has been created. Your tracking number is ${row.tracking_number}.`,\n    tracking_number: row.tracking_number\n  }\n}];"
+      },
+      "id": "n5-inject-tracking",
+      "name": "Inject Tracking Number",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-800, -140]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-escalate",
+              "leftValue": "={{$json.action}}",
+              "rightValue": "ESCALATE_ROUTE",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n6-is-escalate",
+      "name": "Is Escalate Route?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1020, 140]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (customer_id, reason, priority) VALUES ($1, $2, 'MEDIUM') RETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.customer_id, 'Unsupported delivery route: ' + ($json.context.pickup_location || '?') + ' to ' + ($json.context.delivery_location || '?') ] }}" }
+      },
+      "id": "n7-create-escalation",
+      "name": "Create Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-800, 140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Delivery Request State').item.json;\nreturn [{ json: { ...base } }];"
+      },
+      "id": "n8-pass-through-escalation",
+      "name": "Pass Through After Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-580, 140]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $json }];"
+      },
+      "id": "n9-finalize-payload",
+      "name": "Finalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-360, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (id, customer_id, current_intent, current_state, context, is_active)\nVALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'DELIVERY_REQUEST', $3, $4::jsonb, $5)\nON CONFLICT (id) DO UPDATE SET\n  current_intent = EXCLUDED.current_intent,\n  current_state = EXCLUDED.current_state,\n  context = EXCLUDED.context,\n  is_active = EXCLUDED.is_active,\n  updated_at = now()\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.conversation_id || null, $json.customer_id, $json.next_state, JSON.stringify($json.context), !['COMPLETED','IDLE','HUMAN_ESCALATION'].includes($json.next_state) ] }}" }
+      },
+      "id": "n10-upsert-conversation",
+      "name": "Upsert Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-140, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (customer_id, conversation_id, direction, body, intent, status)\nVALUES ($1, $2, 'OUTBOUND', $3, 'DELIVERY_REQUEST', 'PROCESSED')",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, $json.id || null, $('Finalize Payload').item.json.reply ] }}" }
+      },
+      "id": "n11-save-outbound",
+      "name": "Save Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [80, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ($1, 'customer', $2, $3::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.tracking_number ? 'DELIVERY_CREATED' : ($('Finalize Payload').item.json.next_state === 'HUMAN_ESCALATION' ? 'ESCALATION_CREATED' : 'STATE_ADVANCED'), $('Finalize Payload').item.json.customer_id, JSON.stringify({ next_state: $('Finalize Payload').item.json.next_state, tracking_number: $('Finalize Payload').item.json.tracking_number || null }) ] }}" }
+      },
+      "id": "n12-audit-event",
+      "name": "Audit Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [80, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Finalize Payload').item.json;\nreturn [{\n  json: {\n    reply: f.reply,\n    next_state: f.next_state,\n    customer_id: f.customer_id,\n    conversation_id: f.conversation_id,\n    tracking_number: f.tracking_number || null\n  }\n}];"
+      },
+      "id": "n13-build-output",
+      "name": "Build Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, -140]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": { "main": [[{ "node": "Process Delivery Request State", "type": "main", "index": 0 }]] },
+    "Process Delivery Request State": { "main": [[{ "node": "Is Create Delivery?", "type": "main", "index": 0 }]] },
+    "Is Create Delivery?": {
+      "main": [
+        [{ "node": "Create Delivery", "type": "main", "index": 0 }],
+        [{ "node": "Is Escalate Route?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Delivery": { "main": [[{ "node": "Inject Tracking Number", "type": "main", "index": 0 }]] },
+    "Inject Tracking Number": { "main": [[{ "node": "Finalize Payload", "type": "main", "index": 0 }]] },
+    "Is Escalate Route?": {
+      "main": [
+        [{ "node": "Create Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Finalize Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Escalation": { "main": [[{ "node": "Pass Through After Escalation", "type": "main", "index": 0 }]] },
+    "Pass Through After Escalation": { "main": [[{ "node": "Finalize Payload", "type": "main", "index": 0 }]] },
+    "Finalize Payload": { "main": [[{ "node": "Upsert Conversation", "type": "main", "index": 0 }]] },
+    "Upsert Conversation": { "main": [[{ "node": "Save Outbound Message", "type": "main", "index": 0 }]] },
+    "Save Outbound Message": { "main": [[{ "node": "Audit Event", "type": "main", "index": 0 }]] },
+    "Audit Event": { "main": [[{ "node": "Build Output", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

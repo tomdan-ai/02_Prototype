@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SwiftDrop Logistics — WhatsApp Simulator</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="phone">
+    <div class="header">
+      <div class="avatar">SD</div>
+      <div class="info">
+        <div class="name">SwiftDrop Logistics</div>
+        <div class="status" id="status">online</div>
+      </div>
+    </div>
+
+    <div class="customer-bar">
+      <label for="phoneInput">Simulated customer:</label>
+      <input id="phoneInput" type="text" value="08012345678" />
+      <button id="newCustomerBtn" title="Start a fresh conversation with a new random number">New customer</button>
+    </div>
+
+    <div class="conn-banner" id="connBanner">Could not reach the webhook. Check the URL below and that n8n is running.</div>
+
+    <div class="messages" id="messages"></div>
+    <div class="typing" id="typingIndicator" style="visibility: hidden;">SwiftDrop is typing…</div>
+
+    <div class="quick-replies">
+      <button data-msg="I want to send a package">Send a package</button>
+      <button data-msg="How much to send a package?">Get a quote</button>
+      <button data-msg="Where is my package SD-1042?">Track SD-1042</button>
+      <button data-msg="My package is missing">Report a problem</button>
+    </div>
+
+    <div class="input-bar">
+      <input id="messageInput" type="text" placeholder="Type a message" autocomplete="off" />
+      <button id="sendBtn">➤</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,148 @@
+{
+  "id": "swiftdrop-03-quote",
+  "name": "03 - Quote Request",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "n1-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1460, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nlet context = input.context || {};\nif (typeof context === 'string') {\n  try { context = JSON.parse(context); } catch (e) { context = {}; }\n}\nconst text = (input.message || '').trim();\nconst state = input.current_state || 'NEW';\n\nconst PRICES = { SMALL: 3000, MEDIUM: 4500, LARGE: 6000 };\nconst SUPPORTED_ROUTES = [\n  ['Uyo', 'Aba'], ['Aba', 'Uyo'], ['Uyo', 'Port Harcourt'], ['Port Harcourt', 'Uyo']\n];\n\nfunction routeSupported(pickup, dest) {\n  const norm = (s) => (s || '').trim().toLowerCase();\n  return SUPPORTED_ROUTES.some(([a, b]) => norm(a) === norm(pickup) && norm(b) === norm(dest));\n}\n\nlet next_state = state;\nlet reply = '';\nlet action = 'NONE';\n\nswitch (state) {\n  case 'NEW':\n    next_state = 'AWAITING_PICKUP_LOCATION';\n    reply = \"Sure, I can get you a quote. What's the pickup location?\";\n    break;\n\n  case 'AWAITING_PICKUP_LOCATION':\n    context.pickup_location = text;\n    next_state = 'AWAITING_DELIVERY_LOCATION';\n    reply = \"What's the delivery location?\";\n    break;\n\n  case 'AWAITING_DELIVERY_LOCATION':\n    context.delivery_location = text;\n    next_state = 'AWAITING_PACKAGE_SIZE';\n    reply = 'What size is the package? Small, Medium, or Large?';\n    break;\n\n  case 'AWAITING_PACKAGE_SIZE': {\n    const m = text.toUpperCase().match(/SMALL|MEDIUM|LARGE/);\n    if (!m) {\n      next_state = 'AWAITING_PACKAGE_SIZE';\n      reply = 'Please select a package size: Small, Medium, or Large.';\n    } else {\n      context.package_size = m[0];\n      if (!routeSupported(context.pickup_location, context.delivery_location)) {\n        next_state = 'HUMAN_ESCALATION';\n        action = 'ESCALATE_ROUTE';\n        reply = \"That route isn't in our standard pricing list, so I've sent this to our operations team to confirm a quote. They'll follow up shortly.\";\n      } else {\n        const fee = PRICES[context.package_size];\n        context.quote_amount = fee;\n        next_state = 'COMPLETED';\n        reply = `A ${context.package_size.toLowerCase()} package from ${context.pickup_location} to ${context.delivery_location} costs approximately \\u20a6${fee.toLocaleString()}.`;\n      }\n    }\n    break;\n  }\n\n  default:\n    next_state = 'AWAITING_PICKUP_LOCATION';\n    reply = \"Let's start again. What's the pickup location?\";\n}\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    phone: input.phone,\n    conversation_id: input.conversation_id || null,\n    next_state,\n    context,\n    reply,\n    action\n  }\n}];"
+      },
+      "id": "n2-process-state",
+      "name": "Process Quote Request State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1240, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-escalate",
+              "leftValue": "={{$json.action}}",
+              "rightValue": "ESCALATE_ROUTE",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n3-is-escalate",
+      "name": "Is Escalate Route?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1020, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (customer_id, reason, priority) VALUES ($1, $2, 'MEDIUM') RETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.customer_id, 'Unsupported quote route: ' + ($json.context.pickup_location || '?') + ' to ' + ($json.context.delivery_location || '?') ] }}" }
+      },
+      "id": "n4-create-escalation",
+      "name": "Create Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-800, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Quote Request State').item.json;\nreturn [{ json: { ...base } }];"
+      },
+      "id": "n5-pass-through-escalation",
+      "name": "Pass Through After Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-580, -140]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $json }];"
+      },
+      "id": "n6-finalize-payload",
+      "name": "Finalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-360, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (id, customer_id, current_intent, current_state, context, is_active)\nVALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'DELIVERY_QUOTE', $3, $4::jsonb, $5)\nON CONFLICT (id) DO UPDATE SET\n  current_intent = EXCLUDED.current_intent,\n  current_state = EXCLUDED.current_state,\n  context = EXCLUDED.context,\n  is_active = EXCLUDED.is_active,\n  updated_at = now()\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.conversation_id || null, $json.customer_id, $json.next_state, JSON.stringify($json.context), !['COMPLETED','IDLE','HUMAN_ESCALATION'].includes($json.next_state) ] }}" }
+      },
+      "id": "n7-upsert-conversation",
+      "name": "Upsert Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-140, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (customer_id, conversation_id, direction, body, intent, status)\nVALUES ($1, $2, 'OUTBOUND', $3, 'DELIVERY_QUOTE', 'PROCESSED')",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, $json.id || null, $('Finalize Payload').item.json.reply ] }}" }
+      },
+      "id": "n8-save-outbound",
+      "name": "Save Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [80, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ($1, 'customer', $2, $3::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.next_state === 'HUMAN_ESCALATION' ? 'ESCALATION_CREATED' : ($('Finalize Payload').item.json.next_state === 'COMPLETED' ? 'QUOTE_GENERATED' : 'STATE_ADVANCED'), $('Finalize Payload').item.json.customer_id, JSON.stringify({ next_state: $('Finalize Payload').item.json.next_state, quote_amount: $('Finalize Payload').item.json.context.quote_amount || null }) ] }}" }
+      },
+      "id": "n9-audit-event",
+      "name": "Audit Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [300, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Finalize Payload').item.json;\nreturn [{\n  json: {\n    reply: f.reply,\n    next_state: f.next_state,\n    customer_id: f.customer_id,\n    conversation_id: f.conversation_id,\n    quote_amount: f.context.quote_amount || null\n  }\n}];"
+      },
+      "id": "n10-build-output",
+      "name": "Build Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": { "main": [[{ "node": "Process Quote Request State", "type": "main", "index": 0 }]] },
+    "Process Quote Request State": { "main": [[{ "node": "Is Escalate Route?", "type": "main", "index": 0 }]] },
+    "Is Escalate Route?": {
+      "main": [
+        [{ "node": "Create Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Finalize Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Escalation": { "main": [[{ "node": "Pass Through After Escalation", "type": "main", "index": 0 }]] },
+    "Pass Through After Escalation": { "main": [[{ "node": "Finalize Payload", "type": "main", "index": 0 }]] },
+    "Finalize Payload": { "main": [[{ "node": "Upsert Conversation", "type": "main", "index": 0 }]] },
+    "Upsert Conversation": { "main": [[{ "node": "Save Outbound Message", "type": "main", "index": 0 }]] },
+    "Save Outbound Message": { "main": [[{ "node": "Audit Event", "type": "main", "index": 0 }]] },
+    "Audit Event": { "main": [[{ "node": "Build Output", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

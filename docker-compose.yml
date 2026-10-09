@@ -1,0 +1,107 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: swiftdrop-postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  n8n:
+    image: n8nio/n8n:latest   # pin a specific version before submission
+    container_name: swiftdrop-n8n
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GENERIC_TIMEZONE: Africa/Lagos
+      TZ: Africa/Lagos
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      WEBHOOK_URL: http://localhost:5678/
+      # Available to workflow Postgres credentials via ={{$env.POSTGRES_DB}} etc. (see n8n/credentials/)
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5678/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # One-shot: imports the Postgres credential and all workflows, then publishes
+  # each by fixed ID. Safe to re-run (upserts by id) after editing n8n/*.json.
+  n8n-init:
+    image: n8nio/n8n:latest
+    container_name: swiftdrop-n8n-init
+    env_file: .env
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+      - ./n8n/credentials:/credentials:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "n8n import:credentials --input=/credentials/swiftdrop-postgres.json &&
+       n8n import:workflow --input=/workflows &&
+       n8n update:workflow --id=swiftdrop-01-router --active=true &&
+       n8n update:workflow --id=swiftdrop-02-delivery --active=true &&
+       n8n update:workflow --id=swiftdrop-03-quote --active=true &&
+       n8n update:workflow --id=swiftdrop-04-track --active=true &&
+       n8n update:workflow --id=swiftdrop-05-reschedule --active=true &&
+       n8n update:workflow --id=swiftdrop-06-escalation --active=true &&
+       echo 'SwiftDrop: all workflows imported and published.'"
+    restart: "no"
+
+  simulator:
+    image: nginx:alpine
+    container_name: swiftdrop-simulator
+    restart: unless-stopped
+    volumes:
+      - ./simulator:/usr/share/nginx/html:ro
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:
+  n8n_data:

@@ -1,0 +1,153 @@
+{
+  "id": "swiftdrop-06-escalation",
+  "name": "06 - Escalation Handler",
+  "nodes": [
+    {
+      "parameters": { "inputSource": "passthrough" },
+      "id": "n1-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [-1020, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nlet context = input.context || {};\nif (typeof context === 'string') {\n  try { context = JSON.parse(context); } catch (e) { context = {}; }\n}\nconst text = (input.message || '').trim();\nconst state = input.current_state || 'NEW';\n\nconst match = text.toUpperCase().match(/SD-\\d{4,}/);\nif (match) context.tracking_number = match[0];\ncontext.last_message = text;\n\nlet next_state = state;\nlet reply = '';\nlet action = 'NONE';\n\nif (state === 'NEW' && !match) {\n  next_state = 'AWAITING_TRACKING_NUMBER';\n  reply = \"I'm sorry to hear that. Could you share the tracking number for the affected delivery, if you have it? (Reply 'skip' if you don't have it.)\";\n} else {\n  action = 'CREATE_ESCALATION';\n}\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    phone: input.phone,\n    conversation_id: input.conversation_id || null,\n    next_state,\n    context,\n    reply,\n    action\n  }\n}];"
+      },
+      "id": "n2-process-state",
+      "name": "Process Problem State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-800, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-escalate", "leftValue": "={{$json.action}}", "rightValue": "CREATE_ESCALATION", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n3-needs-escalation",
+      "name": "Needs Escalation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-580, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (customer_id, delivery_id, reason, priority)\nVALUES ($1, (SELECT id FROM deliveries WHERE tracking_number = $2), $3, 'HIGH')\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.customer_id, $json.context.tracking_number || null, 'Customer reported a delivery problem' + ($json.context.tracking_number ? ' (tracking ' + $json.context.tracking_number + ')' : ' (no tracking number provided)') + ': ' + $json.context.last_message ] }}" }
+      },
+      "id": "n4-create-escalation",
+      "name": "Create Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-360, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Process Problem State').item.json;\nreturn [{\n  json: {\n    ...base,\n    reply: \"I'm sorry about that. I've forwarded your report to our operations team\" + (base.context.tracking_number ? ` for delivery ${base.context.tracking_number}` : '') + \", and a team member will follow up with you shortly.\",\n    next_state: 'COMPLETED'\n  }\n}];"
+      },
+      "id": "n5-build-escalation-reply",
+      "name": "Build Escalation Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-140, -140]
+    },
+    {
+      "parameters": { "jsCode": "return [{ json: $json }];" },
+      "id": "n6-finalize-payload",
+      "name": "Finalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [80, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (id, customer_id, current_intent, current_state, context, is_active)\nVALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'DELIVERY_PROBLEM', $3, $4::jsonb, $5)\nON CONFLICT (id) DO UPDATE SET\n  current_intent = EXCLUDED.current_intent,\n  current_state = EXCLUDED.current_state,\n  context = EXCLUDED.context,\n  is_active = EXCLUDED.is_active,\n  updated_at = now()\nRETURNING id",
+        "options": { "queryReplacement": "={{ [ $json.conversation_id || null, $json.customer_id, $json.next_state, JSON.stringify($json.context), !['COMPLETED','IDLE','HUMAN_ESCALATION'].includes($json.next_state) ] }}" }
+      },
+      "id": "n7-upsert-conversation",
+      "name": "Upsert Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [300, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (customer_id, conversation_id, direction, body, intent, status)\nVALUES ($1, $2, 'OUTBOUND', $3, 'DELIVERY_PROBLEM', 'PROCESSED')",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, $json.id || null, $('Finalize Payload').item.json.reply ] }}" }
+      },
+      "id": "n8-save-outbound",
+      "name": "Save Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ($1, 'customer', $2, $3::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.next_state === 'COMPLETED' && $('Finalize Payload').item.json.action === 'CREATE_ESCALATION' ? 'ESCALATION_CREATED' : 'STATE_ADVANCED', $('Finalize Payload').item.json.customer_id, JSON.stringify({ tracking_number: $('Finalize Payload').item.json.context.tracking_number || null, priority: 'HIGH' }) ] }}" }
+      },
+      "id": "n9-audit-event",
+      "name": "Audit Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [740, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ('NOTIFICATION_SENT', 'customer', $1, $2::jsonb)",
+        "options": { "queryReplacement": "={{ [ $('Finalize Payload').item.json.customer_id, JSON.stringify({ channel: 'simulated-ops-notification', message: 'NEW ESCALATION (HIGH priority) - tracking: ' + ($('Finalize Payload').item.json.context.tracking_number || 'none provided') + ' - reason: ' + $('Finalize Payload').item.json.context.last_message }) ] }}" }
+      },
+      "id": "n10-notify-ops",
+      "name": "Notify Operations (simulated)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [960, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Finalize Payload').item.json;\nreturn [{\n  json: {\n    reply: f.reply,\n    next_state: f.next_state,\n    customer_id: f.customer_id,\n    conversation_id: f.conversation_id\n  }\n}];"
+      },
+      "id": "n11-build-output",
+      "name": "Build Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": { "main": [[{ "node": "Process Problem State", "type": "main", "index": 0 }]] },
+    "Process Problem State": { "main": [[{ "node": "Needs Escalation?", "type": "main", "index": 0 }]] },
+    "Needs Escalation?": {
+      "main": [
+        [{ "node": "Create Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Finalize Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Escalation": { "main": [[{ "node": "Build Escalation Reply", "type": "main", "index": 0 }]] },
+    "Build Escalation Reply": { "main": [[{ "node": "Finalize Payload", "type": "main", "index": 0 }]] },
+    "Finalize Payload": { "main": [[{ "node": "Upsert Conversation", "type": "main", "index": 0 }]] },
+    "Upsert Conversation": { "main": [[{ "node": "Save Outbound Message", "type": "main", "index": 0 }]] },
+    "Save Outbound Message": { "main": [[{ "node": "Audit Event", "type": "main", "index": 0 }]] },
+    "Audit Event": { "main": [[{ "node": "Notify Operations (simulated)", "type": "main", "index": 0 }]] },
+    "Notify Operations (simulated)": { "main": [[{ "node": "Build Output", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

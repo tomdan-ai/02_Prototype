@@ -1,0 +1,455 @@
+{
+  "id": "swiftdrop-01-router",
+  "name": "01 - Incoming Message Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp",
+        "responseMode": "responseNode",
+        "options": { "allowedOrigins": "*" }
+      },
+      "id": "n1-webhook",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1680, 0],
+      "webhookId": "swiftdrop-whatsapp-inbound"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || {};\nconst errors = [];\nif (!body.phone) errors.push('phone');\nif (!body.message) errors.push('message');\nif (!body.message_id) errors.push('message_id');\n\nif (errors.length > 0) {\n  return [{ json: { valid: false, missing_fields: errors } }];\n}\n\n// Normalize Nigerian phone numbers to +234XXXXXXXXXX\nlet phone = String(body.phone).replace(/[^0-9+]/g, '');\nif (phone.startsWith('0')) {\n  phone = '+234' + phone.slice(1);\n} else if (phone.startsWith('234')) {\n  phone = '+' + phone;\n} else if (!phone.startsWith('+')) {\n  phone = '+' + phone;\n}\n\nreturn [{\n  json: {\n    valid: true,\n    phone,\n    message: String(body.message).trim(),\n    message_id: String(body.message_id),\n    timestamp: body.timestamp || new Date().toISOString()\n  }\n}];"
+      },
+      "id": "n2-validate",
+      "name": "Validate & Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1460, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-valid",
+              "leftValue": "={{$json.valid}}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n3-is-valid",
+      "name": "Is Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-1240, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ('VALIDATION_FAILURE', 'webhook', NULL, $1::jsonb)",
+        "options": { "queryReplacement": "={{ [JSON.stringify({ missing_fields: $json.missing_fields })] }}" }
+      },
+      "id": "n4-audit-validation-fail",
+      "name": "Audit Validation Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-1020, 140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'Missing required fields', missing_fields: $('Validate & Normalize').item.json.missing_fields } }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "n5-respond-400",
+      "name": "Respond 400 Missing Fields",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-800, 140]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO customers (phone) VALUES ($1)\nON CONFLICT (phone) DO UPDATE SET updated_at = now()\nRETURNING id, phone, name",
+        "options": { "queryReplacement": "={{ [$json.phone] }}" }
+      },
+      "id": "n6-upsert-customer",
+      "name": "Upsert Customer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-1020, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const validated = $('Validate & Normalize').item.json;\nconst customer = $json;\nreturn [{\n  json: {\n    customer_id: customer.id,\n    phone: validated.phone,\n    message: validated.message,\n    message_id: validated.message_id,\n    timestamp: validated.timestamp\n  }\n}];"
+      },
+      "id": "n7-build-context",
+      "name": "Build Message Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-800, -140]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT EXISTS(SELECT 1 FROM messages WHERE external_id = $1) AS is_duplicate",
+        "options": { "queryReplacement": "={{ [$json.message_id] }}" }
+      },
+      "id": "n8-duplicate-check",
+      "name": "Duplicate Check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-580, -140],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-dup",
+              "leftValue": "={{$json.is_duplicate}}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n9-is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-360, -140]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ('DUPLICATE_MESSAGE_IGNORED', 'customer', $1, $2::jsonb)",
+        "options": { "queryReplacement": "={{ [$('Build Message Context').item.json.customer_id, JSON.stringify({ message_id: $('Build Message Context').item.json.message_id })] }}" }
+      },
+      "id": "n10-audit-duplicate",
+      "name": "Audit Duplicate Ignored",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-140, 0],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'duplicate_ignored' } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "n11-respond-duplicate",
+      "name": "Respond Duplicate Ignored",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [80, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.id, c.current_intent, c.current_state, c.context\nFROM customers cust\nLEFT JOIN conversations c ON c.customer_id = cust.id AND c.is_active = true\nWHERE cust.id = $1\nORDER BY c.created_at DESC NULLS LAST\nLIMIT 1",
+        "options": { "queryReplacement": "={{ [$('Build Message Context').item.json.customer_id] }}" }
+      },
+      "id": "n12-load-conversation",
+      "name": "Load Active Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-140, -280],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (external_id, customer_id, conversation_id, direction, body, status)\nVALUES ($1, $2, $3, 'INBOUND', $4, 'RECEIVED')\nRETURNING id",
+        "options": { "queryReplacement": "={{ [$('Build Message Context').item.json.message_id, $('Build Message Context').item.json.customer_id, $json.id || null, $('Build Message Context').item.json.message] }}" }
+      },
+      "id": "n13-save-message",
+      "name": "Save Inbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [80, -280],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const convo = $('Load Active Conversation').item.json;\nconst ctx = $('Build Message Context').item.json;\nconst text = (ctx.message || '').toLowerCase();\n\nlet intent = convo.current_intent;\nlet state = convo.current_state;\nconst hadActiveConversation = !!state && state !== 'IDLE';\n\nif (!hadActiveConversation) {\n  if (/track|where is|status/.test(text)) intent = 'TRACK_DELIVERY';\n  else if (/reschedul|postpone|move.*deliver/.test(text)) intent = 'RESCHEDULE_DELIVERY';\n  else if (/missing|problem|hasn.?t arrived|didn.?t deliver|complain/.test(text)) intent = 'DELIVERY_PROBLEM';\n  else if (/quote|how much|cost|price/.test(text)) intent = 'DELIVERY_QUOTE';\n  else if (/send|deliver|pick\\s?up|package/.test(text)) intent = 'DELIVERY_REQUEST';\n  else intent = 'UNKNOWN';\n  state = intent === 'UNKNOWN' ? 'HUMAN_ESCALATION' : 'NEW';\n}\n\nlet context = convo.context || {};\nif (typeof context === 'string') {\n  try { context = JSON.parse(context); } catch (e) { context = {}; }\n}\n\nreturn [{\n  json: {\n    customer_id: ctx.customer_id,\n    phone: ctx.phone,\n    message: ctx.message,\n    message_id: ctx.message_id,\n    conversation_id: convo.id || null,\n    intent,\n    state,\n    current_state: state,\n    context,\n    continued_conversation: hadActiveConversation\n  }\n}];"
+      },
+      "id": "n14-classify-intent",
+      "name": "Classify Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, -280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-delivery",
+              "leftValue": "={{$json.intent}}",
+              "rightValue": "DELIVERY_REQUEST",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n17-is-delivery-request",
+      "name": "Is Delivery Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [520, -280]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": { "__rl": true, "value": "swiftdrop-02-delivery", "mode": "list", "cachedResultName": "02 - Delivery Request" },
+        "mode": "once",
+        "options": {}
+      },
+      "id": "n18-execute-delivery-request",
+      "name": "Run Delivery Request Flow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [740, -400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-quote",
+              "leftValue": "={{$json.intent}}",
+              "rightValue": "DELIVERY_QUOTE",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n20-is-delivery-quote",
+      "name": "Is Delivery Quote?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [740, -160]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": { "__rl": true, "value": "swiftdrop-03-quote", "mode": "list", "cachedResultName": "03 - Quote Request" },
+        "mode": "once",
+        "options": {}
+      },
+      "id": "n21-execute-quote-request",
+      "name": "Run Quote Request Flow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [960, -400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'received', reply: $json.reply, intent: $('Classify Intent').item.json.intent, state: $json.next_state, customer_id: $json.customer_id, tracking_number: $json.tracking_number || null, quote_amount: $json.quote_amount || null } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "n19-respond-with-reply",
+      "name": "Respond With Reply",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1840, -400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-track", "leftValue": "={{$json.intent}}", "rightValue": "TRACK_DELIVERY", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n22-is-track-delivery",
+      "name": "Is Track Delivery?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [960, -160]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": { "__rl": true, "value": "swiftdrop-04-track", "mode": "list", "cachedResultName": "04 - Track Delivery" },
+        "mode": "once",
+        "options": {}
+      },
+      "id": "n23-execute-track-delivery",
+      "name": "Run Track Delivery Flow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [1180, -400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-reschedule", "leftValue": "={{$json.intent}}", "rightValue": "RESCHEDULE_DELIVERY", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n24-is-reschedule",
+      "name": "Is Reschedule?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1180, -160]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": { "__rl": true, "value": "swiftdrop-05-reschedule", "mode": "list", "cachedResultName": "05 - Reschedule Delivery" },
+        "mode": "once",
+        "options": {}
+      },
+      "id": "n25-execute-reschedule",
+      "name": "Run Reschedule Flow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [1400, -400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "cond-problem", "leftValue": "={{$json.intent}}", "rightValue": "DELIVERY_PROBLEM", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n26-is-delivery-problem",
+      "name": "Is Delivery Problem?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1400, -160]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": { "__rl": true, "value": "swiftdrop-06-escalation", "mode": "list", "cachedResultName": "06 - Escalation Handler" },
+        "mode": "once",
+        "options": {}
+      },
+      "id": "n27-execute-escalation",
+      "name": "Run Escalation Handler Flow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [1620, -400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (event_type, entity_type, entity_id, details) VALUES ('INTENT_CLASSIFIED', 'customer', $1, $2::jsonb)",
+        "options": { "queryReplacement": "={{ [$json.customer_id, JSON.stringify({ intent: $json.intent, state: $json.state, message_id: $json.message_id, continued_conversation: $json.continued_conversation })] }}" }
+      },
+      "id": "n15-audit-intent",
+      "name": "Audit Intent Classified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1620, -160],
+      "credentials": { "postgres": { "id": "swiftdrop-postgres-cred", "name": "SwiftDrop Postgres" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'received', intent: $('Classify Intent').item.json.intent, state: $('Classify Intent').item.json.state, customer_id: $('Classify Intent').item.json.customer_id } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "n16-respond-routed",
+      "name": "Respond Routed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1840, -160]
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": { "main": [[{ "node": "Validate & Normalize", "type": "main", "index": 0 }]] },
+    "Validate & Normalize": { "main": [[{ "node": "Is Valid?", "type": "main", "index": 0 }]] },
+    "Is Valid?": {
+      "main": [
+        [{ "node": "Upsert Customer", "type": "main", "index": 0 }],
+        [{ "node": "Audit Validation Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Audit Validation Failure": { "main": [[{ "node": "Respond 400 Missing Fields", "type": "main", "index": 0 }]] },
+    "Upsert Customer": { "main": [[{ "node": "Build Message Context", "type": "main", "index": 0 }]] },
+    "Build Message Context": { "main": [[{ "node": "Duplicate Check", "type": "main", "index": 0 }]] },
+    "Duplicate Check": { "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]] },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Audit Duplicate Ignored", "type": "main", "index": 0 }],
+        [{ "node": "Load Active Conversation", "type": "main", "index": 0 }]
+      ]
+    },
+    "Audit Duplicate Ignored": { "main": [[{ "node": "Respond Duplicate Ignored", "type": "main", "index": 0 }]] },
+    "Load Active Conversation": { "main": [[{ "node": "Save Inbound Message", "type": "main", "index": 0 }]] },
+    "Save Inbound Message": { "main": [[{ "node": "Classify Intent", "type": "main", "index": 0 }]] },
+    "Classify Intent": { "main": [[{ "node": "Is Delivery Request?", "type": "main", "index": 0 }]] },
+    "Is Delivery Request?": {
+      "main": [
+        [{ "node": "Run Delivery Request Flow", "type": "main", "index": 0 }],
+        [{ "node": "Is Delivery Quote?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Run Delivery Request Flow": { "main": [[{ "node": "Respond With Reply", "type": "main", "index": 0 }]] },
+    "Is Delivery Quote?": {
+      "main": [
+        [{ "node": "Run Quote Request Flow", "type": "main", "index": 0 }],
+        [{ "node": "Is Track Delivery?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Run Quote Request Flow": { "main": [[{ "node": "Respond With Reply", "type": "main", "index": 0 }]] },
+    "Is Track Delivery?": {
+      "main": [
+        [{ "node": "Run Track Delivery Flow", "type": "main", "index": 0 }],
+        [{ "node": "Is Reschedule?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Run Track Delivery Flow": { "main": [[{ "node": "Respond With Reply", "type": "main", "index": 0 }]] },
+    "Is Reschedule?": {
+      "main": [
+        [{ "node": "Run Reschedule Flow", "type": "main", "index": 0 }],
+        [{ "node": "Is Delivery Problem?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Run Reschedule Flow": { "main": [[{ "node": "Respond With Reply", "type": "main", "index": 0 }]] },
+    "Is Delivery Problem?": {
+      "main": [
+        [{ "node": "Run Escalation Handler Flow", "type": "main", "index": 0 }],
+        [{ "node": "Audit Intent Classified", "type": "main", "index": 0 }]
+      ]
+    },
+    "Run Escalation Handler Flow": { "main": [[{ "node": "Respond With Reply", "type": "main", "index": 0 }]] },
+    "Audit Intent Classified": { "main": [[{ "node": "Respond Routed", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
